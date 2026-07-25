@@ -10,6 +10,7 @@ mcp = FastMCP("expense traccker")
 
 def init_db():
     with sqlite3.connect(DB_PATH) as c:
+        c.execute("PRAGMA journal_mode=MEMORY")
         c.execute("""
             CREATE TABLE IF NOT EXISTS expenses(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
