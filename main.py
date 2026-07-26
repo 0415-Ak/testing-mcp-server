@@ -1,14 +1,47 @@
 from fastmcp import FastMCP
 import os
 import json
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 import aiosqlite
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
-print(f"Database path: {DB_PATH}")
+def resolve_db_path() -> str:
+    '''Pick the first writable location for the database: DATA_DIR env var (for a mounted
+    persistent volume) > the project folder (local dev) > the system temp dir (last-resort
+    fallback so the server still starts on hosts with a read-only app directory, e.g. FastMCP
+    Cloud without a volume attached). Prints which one was chosen and warns if it's ephemeral.'''
+    candidates = []
+    env_dir = os.environ.get("DATA_DIR")
+    if env_dir:
+        candidates.append((env_dir, False))
+    candidates.append((os.path.dirname(__file__), False))
+    candidates.append((tempfile.gettempdir(), True))
+
+    for directory, is_ephemeral in candidates:
+        try:
+            os.makedirs(directory, exist_ok=True)
+            probe = os.path.join(directory, ".write_test")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            path = os.path.join(directory, "expenses.db")
+            if is_ephemeral:
+                print(f"WARNING: no persistent storage found. Using ephemeral path {path} "
+                      f"- data will NOT survive a restart or redeploy. Set the DATA_DIR env "
+                      f"var to a persistent volume path to fix this.")
+            else:
+                print(f"Database path: {path}")
+            return path
+        except OSError:
+            continue
+
+    raise RuntimeError("No writable directory found for the database (checked DATA_DIR, project folder, and temp dir).")
+
+
+DB_PATH = resolve_db_path()
+CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 mcp = FastMCP("ExpenseTracker")
 
