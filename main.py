@@ -190,8 +190,8 @@ async def delete_expense(id: int) -> dict:
 
 @mcp.tool()
 async def list_expenses(
-    start_date: str,
-    end_date: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     category: Optional[str] = None,
     subcategory: Optional[str] = None,
     min_amount: Optional[float] = None,
@@ -200,14 +200,20 @@ async def list_expenses(
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
-    '''List expenses within an inclusive date range. Supports optional filters (category, subcategory, min_amount, max_amount, search over notes) and pagination via limit/offset.'''
-    date_err = validate_date(start_date) or validate_date(end_date)
+    '''List expenses. Leave start_date and end_date empty to list all expenses ever recorded; provide either or both to restrict to a date range (inclusive). Supports optional filters (category, subcategory, min_amount, max_amount, search over notes) and pagination via limit/offset.'''
+    date_err = (validate_date(start_date) if start_date else None) or (validate_date(end_date) if end_date else None)
     if date_err:
         return {"status": "error", "message": date_err}
     try:
-        query = "SELECT * FROM expenses WHERE date BETWEEN ? AND ?"
-        params = [start_date, end_date]
+        query = "SELECT * FROM expenses WHERE 1=1"
+        params = []
 
+        if start_date:
+            query += " AND date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND date <= ?"
+            params.append(end_date)
         if category:
             query += " AND category = ?"
             params.append(category)
@@ -236,19 +242,25 @@ async def list_expenses(
 
 
 @mcp.tool()
-async def summarize(start_date: str, end_date: str, category: Optional[str] = None) -> dict:
-    '''Summarize total spend and entry count grouped by category, within an inclusive date range. Pass category to restrict to one category.'''
-    date_err = validate_date(start_date) or validate_date(end_date)
+async def summarize(start_date: Optional[str] = None, end_date: Optional[str] = None, category: Optional[str] = None) -> dict:
+    '''Summarize total spend and entry count grouped by category. Leave start_date and end_date empty to summarize all expenses ever recorded; provide either or both to restrict to a date range (inclusive). Pass category to restrict to one category.'''
+    date_err = (validate_date(start_date) if start_date else None) or (validate_date(end_date) if end_date else None)
     if date_err:
         return {"status": "error", "message": date_err}
     try:
         query = """
             SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
             FROM expenses
-            WHERE date BETWEEN ? AND ?
+            WHERE 1=1
         """
-        params = [start_date, end_date]
+        params = []
 
+        if start_date:
+            query += " AND date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND date <= ?"
+            params.append(end_date)
         if category:
             query += " AND category = ?"
             params.append(category)
