@@ -1,49 +1,73 @@
 from fastmcp import FastMCP
 import os
 import json
-import tempfile
 from datetime import datetime, timezone
 from typing import Optional
-import aiosqlite
+import asyncpg
+from dotenv import load_dotenv
 
+load_dotenv()
 
-def resolve_db_path() -> str:
-    '''Pick the first writable location for the database: DATA_DIR env var (for a mounted
-    persistent volume) > the project folder (local dev) > the system temp dir (last-resort
-    fallback so the server still starts on hosts with a read-only app directory, e.g. FastMCP
-    Cloud without a volume attached). Prints which one was chosen and warns if it's ephemeral.'''
-    candidates = []
-    env_dir = os.environ.get("DATA_DIR")
-    if env_dir:
-        candidates.append((env_dir, False))
-    candidates.append((os.path.dirname(__file__), False))
-    candidates.append((tempfile.gettempdir(), True))
-
-    for directory, is_ephemeral in candidates:
-        try:
-            os.makedirs(directory, exist_ok=True)
-            probe = os.path.join(directory, ".write_test")
-            with open(probe, "w") as f:
-                f.write("ok")
-            os.remove(probe)
-            path = os.path.join(directory, "expenses.db")
-            if is_ephemeral:
-                print(f"WARNING: no persistent storage found. Using ephemeral path {path} "
-                      f"- data will NOT survive a restart or redeploy. Set the DATA_DIR env "
-                      f"var to a persistent volume path to fix this.")
-            else:
-                print(f"Database path: {path}")
-            return path
-        except OSError:
-            continue
-
-    raise RuntimeError("No writable directory found for the database (checked DATA_DIR, project folder, and temp dir).")
-
-
-DB_PATH = resolve_db_path()
+DATABASE_URL = os.environ.get("DATABASE_URL")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Create a .env file (locally) or a DATABASE_URL "
+        "environment variable (on FastMCP Cloud) with your Supabase connection string."
+    )
+
 mcp = FastMCP("ExpenseTracker")
+
+_pool: Optional[asyncpg.Pool] = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    '''Lazily create the connection pool on first use, inside the server's real event loop,
+    and ensure the schema exists. asyncpg pools are bound to the event loop they're created
+    on, so this must NOT be created at import time - only from inside an async tool call.'''
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            statement_cache_size=0,  # avoids known prepared-statement issues with Supabase's pooler
+        )
+        await ensure_schema(_pool)
+    return _pool
+
+
+async def ensure_schema(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as c:
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS expenses(
+                id SERIAL PRIMARY KEY,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT ''
+            )
+        """)
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_at TEXT DEFAULT ''")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''")
+    print("Database schema ready (Supabase/Postgres)")
+
+
+def qmarks_to_dollars(query: str) -> str:
+    '''Convert our SQLite-style "?" placeholders to Postgres-style "$1, $2, ..." in order.'''
+    out = []
+    n = 0
+    for ch in query:
+        if ch == "?":
+            n += 1
+            out.append(f"${n}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def load_categories() -> dict:
@@ -81,44 +105,8 @@ def validate_amount(amount) -> Optional[str]:
     return None
 
 
-def rows_to_dicts(cursor, rows) -> list:
-    cols = [d[0] for d in cursor.description]
-    return [dict(zip(cols, r)) for r in rows]
-
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def init_db():
-    try:
-        import sqlite3
-        with sqlite3.connect(DB_PATH) as c:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS expenses(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    category TEXT NOT NULL,
-                    subcategory TEXT DEFAULT '',
-                    note TEXT DEFAULT '',
-                    created_at TEXT DEFAULT '',
-                    updated_at TEXT DEFAULT ''
-                )
-            """)
-            existing_cols = {row[1] for row in c.execute("PRAGMA table_info(expenses)")}
-            if "created_at" not in existing_cols:
-                c.execute("ALTER TABLE expenses ADD COLUMN created_at TEXT DEFAULT ''")
-            if "updated_at" not in existing_cols:
-                c.execute("ALTER TABLE expenses ADD COLUMN updated_at TEXT DEFAULT ''")
-            print("Database initialized successfully with write access")
-    except Exception as e:
-        print(f"Database initialization error: {e}")
-        raise
-
-
-init_db()
 
 
 @mcp.tool()
@@ -134,15 +122,15 @@ async def add_expense(
         if err:
             return {"status": "error", "message": err}
     try:
+        pool = await get_pool()
         ts = now_iso()
-        async with aiosqlite.connect(DB_PATH) as c:
-            cur = await c.execute(
+        async with pool.acquire() as c:
+            row = await c.fetchrow(
                 """INSERT INTO expenses(date, amount, category, subcategory, note, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (date, amount, category, subcategory, note, ts, ts),
+                   VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+                date, amount, category, subcategory, note, ts, ts,
             )
-            await c.commit()
-            return {"status": "success", "data": {"id": cur.lastrowid}}
+            return {"status": "success", "data": {"id": row["id"]}}
     except Exception as e:
         return {"status": "error", "message": f"Database error: {str(e)}"}
 
@@ -151,13 +139,12 @@ async def add_expense(
 async def get_expense(id: int) -> dict:
     '''Fetch a single expense entry by its id.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as c:
-            cur = await c.execute("SELECT * FROM expenses WHERE id = ?", (id,))
-            rows = await cur.fetchall()
-            results = rows_to_dicts(cur, rows)
-            if not results:
+        pool = await get_pool()
+        async with pool.acquire() as c:
+            row = await c.fetchrow("SELECT * FROM expenses WHERE id = $1", id)
+            if not row:
                 return {"status": "error", "message": f"No expense found with id {id}"}
-            return {"status": "success", "data": results[0]}
+            return {"status": "success", "data": dict(row)}
     except Exception as e:
         return {"status": "error", "message": f"Database error: {str(e)}"}
 
@@ -173,13 +160,11 @@ async def update_expense(
 ) -> dict:
     '''Update one or more fields of an existing expense by id. Only the fields you provide are changed; everything else is left as-is.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as c:
-            cur = await c.execute("SELECT * FROM expenses WHERE id = ?", (id,))
-            rows = await cur.fetchall()
-            existing = rows_to_dicts(cur, rows)
-            if not existing:
+        pool = await get_pool()
+        async with pool.acquire() as c:
+            current = await c.fetchrow("SELECT * FROM expenses WHERE id = $1", id)
+            if not current:
                 return {"status": "error", "message": f"No expense found with id {id}"}
-            current = existing[0]
 
             new_date = date if date is not None else current["date"]
             new_amount = amount if amount is not None else current["amount"]
@@ -197,11 +182,10 @@ async def update_expense(
 
             await c.execute(
                 """UPDATE expenses
-                   SET date=?, amount=?, category=?, subcategory=?, note=?, updated_at=?
-                   WHERE id=?""",
-                (new_date, new_amount, new_category, new_subcategory, new_note, now_iso(), id),
+                   SET date=$1, amount=$2, category=$3, subcategory=$4, note=$5, updated_at=$6
+                   WHERE id=$7""",
+                new_date, new_amount, new_category, new_subcategory, new_note, now_iso(), id,
             )
-            await c.commit()
             return {"status": "success", "data": {"id": id}}
     except Exception as e:
         return {"status": "error", "message": f"Database error: {str(e)}"}
@@ -211,10 +195,10 @@ async def update_expense(
 async def delete_expense(id: int) -> dict:
     '''Delete an expense entry by id.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as c:
-            cur = await c.execute("DELETE FROM expenses WHERE id = ?", (id,))
-            await c.commit()
-            if cur.rowcount == 0:
+        pool = await get_pool()
+        async with pool.acquire() as c:
+            row = await c.fetchrow("DELETE FROM expenses WHERE id = $1 RETURNING id", id)
+            if not row:
                 return {"status": "error", "message": f"No expense found with id {id}"}
             return {"status": "success", "data": {"id": id}}
     except Exception as e:
@@ -266,10 +250,10 @@ async def list_expenses(
         query += " ORDER BY date DESC, id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        async with aiosqlite.connect(DB_PATH) as c:
-            cur = await c.execute(query, params)
-            rows = await cur.fetchall()
-            return {"status": "success", "data": rows_to_dicts(cur, rows)}
+        pool = await get_pool()
+        async with pool.acquire() as c:
+            rows = await c.fetch(qmarks_to_dollars(query), *params)
+            return {"status": "success", "data": [dict(r) for r in rows]}
     except Exception as e:
         return {"status": "error", "message": f"Error listing expenses: {str(e)}"}
 
@@ -300,10 +284,10 @@ async def summarize(start_date: Optional[str] = None, end_date: Optional[str] = 
 
         query += " GROUP BY category ORDER BY total_amount DESC"
 
-        async with aiosqlite.connect(DB_PATH) as c:
-            cur = await c.execute(query, params)
-            rows = await cur.fetchall()
-            return {"status": "success", "data": rows_to_dicts(cur, rows)}
+        pool = await get_pool()
+        async with pool.acquire() as c:
+            rows = await c.fetch(qmarks_to_dollars(query), *params)
+            return {"status": "success", "data": [dict(r) for r in rows]}
     except Exception as e:
         return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
 
